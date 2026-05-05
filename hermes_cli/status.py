@@ -39,6 +39,29 @@ def redact_key(key: str) -> str:
     return mask_secret(key, empty=color("(not set)", Colors.DIM))
 
 
+def sudo_status() -> tuple[bool, str]:
+    """Report whether sudo is available and how it is configured."""
+    sudo_password = os.getenv("SUDO_PASSWORD", "")
+    if sudo_password:
+        return True, "enabled (.env password)"
+
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "true"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return False, "disabled"
+
+    if result.returncode == 0:
+        return True, "enabled (passwordless sudo)"
+
+    return False, "disabled"
+
+
 def _format_iso_timestamp(value) -> str:
     """Format ISO timestamps for status output, converting to local timezone."""
     if not value or not isinstance(value, str):
@@ -379,8 +402,8 @@ def show_status(args):
         print(f"  Persistence:  {'snapshot filesystem' if persist_enabled else 'ephemeral filesystem'}")
         print("  Processes:    live processes do not survive cleanup, snapshots, or sandbox recreation")
 
-    sudo_password = os.getenv("SUDO_PASSWORD", "")
-    print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")
+    sudo_enabled, sudo_label = sudo_status()
+    print(f"  Sudo:         {check_mark(sudo_enabled)} {sudo_label}")
 
     # =========================================================================
     # Messaging Platforms

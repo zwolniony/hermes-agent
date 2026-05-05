@@ -90,9 +90,15 @@ Use Semantic Scholar for ML/AI papers:
 
 ```python
 from semanticscholar import SemanticScholar
+import subprocess
+import time
 
-sch = SemanticScholar()
+api_key = subprocess.check_output([
+    "security", "find-generic-password", "-a", "openclaw", "-s", "semantic-scholar-api-key", "-w"
+], text=True).strip()
+sch = SemanticScholar(api_key=api_key)
 results = sch.search_paper("transformer attention mechanism", limit=10)
+time.sleep(1.1)  # Semantic Scholar free key rate limit: 1 request/sec
 
 for paper in results:
     print(f"Title: {paper.title}")
@@ -109,13 +115,18 @@ Confirm paper exists in at least two sources:
 
 ```python
 import requests
+import subprocess
+from semanticscholar import SemanticScholar
 
 def verify_paper(doi=None, arxiv_id=None, title=None):
     """Verify paper exists in multiple sources."""
     sources_found = []
 
     # Check Semantic Scholar
-    sch = SemanticScholar()
+    api_key = subprocess.check_output([
+        "security", "find-generic-password", "-a", "openclaw", "-s", "semantic-scholar-api-key", "-w"
+    ], text=True).strip()
+    sch = SemanticScholar(api_key=api_key)
     if doi:
         paper = sch.get_paper(f"DOI:{doi}")
         if paper:
@@ -165,9 +176,15 @@ print(bibtex)
 Before citing a paper for a specific claim, verify the claim exists:
 
 ```python
+import subprocess
+from semanticscholar import SemanticScholar
+
 def get_paper_abstract(doi):
     """Get abstract to verify claims."""
-    sch = SemanticScholar()
+    api_key = subprocess.check_output([
+        "security", "find-generic-password", "-a", "openclaw", "-s", "semantic-scholar-api-key", "-w"
+    ], text=True).strip()
+    sch = SemanticScholar(api_key=api_key)
     paper = sch.get_paper(f"DOI:{doi}")
     return paper.abstract if paper else None
 

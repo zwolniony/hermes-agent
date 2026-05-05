@@ -517,26 +517,35 @@ def _resolve_api_key_provider_secret(
             pass
         return "", ""
 
+    # Prefer the credential pool first. API-key providers can be configured via
+    # manual entries in auth.json (for example from dashboard flows or direct
+    # auth-management commands), and falling back to env vars first causes valid
+    # pooled credentials to be ignored.
+    try:
+        from agent.credential_pool import load_pool
+
+        pool = load_pool(provider_id)
+        if pool and pool.has_credentials():
+            entry = pool.select()
+            if entry is not None:
+                token = (
+                    getattr(entry, "runtime_api_key", None)
+                    or getattr(entry, "access_token", "")
+                    or ""
+                )
+                token = str(token).strip()
+                if has_usable_secret(token):
+                    label = str(getattr(entry, "label", "") or getattr(entry, "source", "pool")).strip()
+                    return token, f"pool:{label}"
+    except Exception:
+        pass
+
     from hermes_cli.config import get_env_value
     for env_var in pconfig.api_key_env_vars:
         # Check both os.environ and ~/.hermes/.env file
         val = (get_env_value(env_var) or "").strip()
         if has_usable_secret(val):
             return val, env_var
-
-    # Fallback: try credential pool (e.g. zai key stored via auth.json)
-    try:
-        from agent.credential_pool import load_pool
-        pool = load_pool(provider_id)
-        if pool and pool.has_credentials():
-            entry = pool.peek()
-            if entry:
-                key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
-                key = str(key).strip()
-                if has_usable_secret(key):
-                    return key, f"credential_pool:{provider_id}"
-    except Exception:
-        pass
 
     return "", ""
 

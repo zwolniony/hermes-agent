@@ -42,6 +42,7 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         calls = []
 
@@ -65,6 +66,7 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         calls = []
 
@@ -88,6 +90,7 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         calls = []
 
@@ -433,7 +436,7 @@ class TestLaunchdServiceRecovery:
         target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
-        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart_detached", lambda pid, *, target, delay_seconds=2.0: False)
         monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
         monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: calls.append(("term", pid, force)))
         monkeypatch.setattr(
@@ -454,7 +457,7 @@ class TestLaunchdServiceRecovery:
             ["launchctl", "kickstart", "-k", target],
         ]
 
-    def test_launchd_restart_self_requests_graceful_restart_without_kickstart(self, monkeypatch, capsys):
+    def test_launchd_restart_from_gateway_session_uses_detached_supervisor(self, monkeypatch, capsys):
         calls = []
 
         monkeypatch.setattr(
@@ -463,19 +466,31 @@ class TestLaunchdServiceRecovery:
         )
         monkeypatch.setattr(
             gateway_cli,
+            "_request_gateway_self_restart_detached",
+            lambda pid, *, target, delay_seconds=2.0: calls.append(("detached", pid, target, delay_seconds)) or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
             "_request_gateway_self_restart",
-            lambda pid: calls.append(("self", pid)) or True,
+            lambda pid: (_ for _ in ()).throw(AssertionError("direct self-restart should not run for launchd")),
         )
         monkeypatch.setattr(
             gateway_cli.subprocess,
             "run",
-            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("launchctl should not run")),
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("launchctl should be left to detached supervisor")),
         )
 
         gateway_cli.launchd_restart()
 
-        assert calls == [("self", 321)]
-        assert "restart requested" in capsys.readouterr().out.lower()
+        assert calls == [
+            (
+                "detached",
+                321,
+                f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}",
+                2.0,
+            )
+        ]
+        assert "detached restart supervisor" in capsys.readouterr().out.lower()
 
     def test_launchd_stop_uses_bootout_not_kill(self, monkeypatch):
         """launchd_stop must bootout the service so KeepAlive doesn't respawn it."""
@@ -616,6 +631,7 @@ class TestGatewaySystemServiceRouting:
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
@@ -671,6 +687,7 @@ class TestGatewaySystemServiceRouting:
     def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(
             "gateway.status.read_runtime_status",
@@ -1440,8 +1457,8 @@ class TestProfileArg:
         monkeypatch.setenv("HERMES_HOME", str(profile_dir))
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
         plist = gateway_cli.generate_launchd_plist()
-        assert "<string>--profile</string>" in plist
-        assert "<string>mybot</string>" in plist
+        assert "--profile mybot" in plist
+        assert "gateway run --replace" in plist
 
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"

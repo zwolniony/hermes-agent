@@ -183,6 +183,125 @@ def _request_gateway_self_restart(pid: int) -> bool:
     return True
 
 
+def _request_gateway_self_restart_detached(
+    pid: int,
+    *,
+    target: str,
+    delay_seconds: float = 2.0,
+) -> bool:
+    """Spawn a supervisor that restarts a launchd gateway ancestor after we return.
+
+    Chat-triggered ``hermes gateway restart`` runs inside a subprocess spawned by
+    the gateway itself. Sending SIGUSR1 directly kills the parent gateway before
+    the command can finish cleanly. This detached supervisor waits briefly so the
+    chat command can return, asks the parent to drain via SIGUSR1, then nudges
+    launchd to start the job again if it did not come back on its own.
+    """
+    if not hasattr(signal, "SIGUSR1"):
+        return False
+    if not _is_pid_ancestor_of_current_process(pid):
+        return False
+
+    plist_path = get_launchd_plist_path()
+    domain = _launchd_domain()
+    drain_timeout = _get_restart_drain_timeout()
+    log_path = get_hermes_home() / "logs" / "gateway-restart-supervisor.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    supervisor_code = textwrap.dedent(
+        """
+        import os
+        import signal
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        pid = int(sys.argv[1])
+        target = sys.argv[2]
+        domain = sys.argv[3]
+        plist_path = sys.argv[4]
+        delay_seconds = float(sys.argv[5])
+        drain_timeout = float(sys.argv[6])
+
+        def log(message):
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+
+        def pid_alive(value):
+            try:
+                os.kill(value, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+
+        log(f"supervisor starting for gateway pid={pid} target={target}")
+        time.sleep(max(delay_seconds, 0.0))
+        try:
+            os.kill(pid, signal.SIGUSR1)
+            log("sent SIGUSR1 for graceful gateway restart")
+        except ProcessLookupError:
+            log("gateway process already exited before SIGUSR1")
+        except Exception as exc:
+            log(f"failed to signal gateway: {exc}")
+
+        deadline = time.monotonic() + max(drain_timeout, 1.0) + 10.0
+        old_exited = False
+        while time.monotonic() < deadline:
+            if not pid_alive(pid):
+                old_exited = True
+                break
+            time.sleep(0.5)
+
+        if old_exited:
+            cmd = ["launchctl", "kickstart", target]
+        else:
+            log("gateway did not exit before timeout; forcing launchd kickstart")
+            cmd = ["launchctl", "kickstart", "-k", target]
+
+        log("running " + " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        if result.returncode in (3, 113):
+            log("launchd job unloaded; bootstrapping service definition")
+            subprocess.run(["launchctl", "bootstrap", domain, plist_path], check=False, timeout=30)
+            result = subprocess.run(["launchctl", "kickstart", target], capture_output=True, text=True, timeout=30)
+
+        if result.stdout:
+            log("stdout: " + result.stdout.strip())
+        if result.stderr:
+            log("stderr: " + result.stderr.strip())
+        log(f"supervisor finished with returncode={result.returncode}")
+        raise SystemExit(0 if result.returncode == 0 else result.returncode)
+        """
+    )
+
+    try:
+        with log_path.open("ab") as log_file:
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    supervisor_code,
+                    str(pid),
+                    target,
+                    domain,
+                    str(plist_path),
+                    str(delay_seconds),
+                    str(drain_timeout),
+                ],
+                cwd=str(PROJECT_ROOT),
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
     """Send SIGUSR1 to a gateway PID and wait for it to exit gracefully.
 
@@ -2233,13 +2352,33 @@ def _launchd_domain() -> str:
 
 
 def generate_launchd_plist() -> str:
+    import getpass
+
     python_path = get_python_path()
     working_dir = str(PROJECT_ROOT)
     hermes_home = str(get_hermes_home().resolve())
-    log_dir = get_hermes_home() / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
     profile_arg = _profile_arg(hermes_home)
+    # launchd does not pass HOME/USER/LOGNAME to LaunchAgents by default; many
+    # downstream tools (and the hermes startup itself) assume they are present,
+    # so resolve them at plist-write time and inject explicitly. Mirrors what
+    # the systemd unit already does above.
+    user_home = os.path.expanduser("~")
+    username = (os.getenv("USER") or os.getenv("LOGNAME") or getpass.getuser()).strip()
+    # launchd's StandardOutPath/StandardErrorPath are opened by launchd itself
+    # before spawning the program. When HERMES_HOME points at (or symlinks
+    # into) an external volume like /Volumes/<name>, macOS TCC denies launchd
+    # the access and the spawn fails immediately with EX_CONFIG=78 before any
+    # output is produced. Anchor launchd's stdio under ~/Library/Logs so the
+    # spawn always succeeds; the application's own log files stay under
+    # HERMES_HOME/logs as before. (Per Apple's logging conventions, ~/Library/
+    # Logs is the canonical place for per-user app logs anyway.)
+    launchd_log_dir = Path(user_home) / "Library" / "Logs"
+    launchd_log_dir.mkdir(parents=True, exist_ok=True)
+    launchd_stdout_path = launchd_log_dir / f"{label}.stdout.log"
+    launchd_stderr_path = launchd_log_dir / f"{label}.stderr.log"
+    # Ensure HERMES_HOME/logs exists too — the application writes there.
+    (get_hermes_home() / "logs").mkdir(parents=True, exist_ok=True)
     # Build a sane PATH for the launchd plist.  launchd provides only a
     # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
     # nvm, cargo, etc.  We prepend venv/bin and node_modules/.bin (matching
@@ -2261,20 +2400,24 @@ def generate_launchd_plist() -> str:
         dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p])
     )
 
-    # Build ProgramArguments array, including --profile when using a named profile
-    prog_args = [
-        f"<string>{python_path}</string>",
-        "<string>-m</string>",
-        "<string>hermes_cli.main</string>",
-    ]
+    # Build the inner command. We invoke through /bin/bash -c so the
+    # launchd-spawned binary is /bin/bash (system-protected, requires no
+    # Full Disk Access). bash then inherits the user's session permissions
+    # and can exec the venv python from an external volume like /Volumes/T7
+    # without macOS TCC blocking the launch. Spawning the venv python
+    # directly as the launchd target silently fails on those volumes
+    # (EX_CONFIG=78 with no stdout/stderr produced).
+    import shlex
+    inner_argv = [python_path, "-u", "-m", "hermes_cli.main"]
     if profile_arg:
-        for part in profile_arg.split():
-            prog_args.append(f"<string>{part}</string>")
-    prog_args.extend([
-        "<string>gateway</string>",
-        "<string>run</string>",
-        "<string>--replace</string>",
-    ])
+        inner_argv.extend(profile_arg.split())
+    inner_argv.extend(["gateway", "run", "--replace"])
+    inner_cmd = " ".join(shlex.quote(a) for a in inner_argv)
+    prog_args = [
+        "<string>/bin/bash</string>",
+        "<string>-c</string>",
+        f"<string>exec {inner_cmd}</string>",
+    ]
     prog_args_xml = "\n        ".join(prog_args)
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -2296,6 +2439,12 @@ def generate_launchd_plist() -> str:
     <dict>
         <key>PATH</key>
         <string>{sane_path}</string>
+        <key>HOME</key>
+        <string>{user_home}</string>
+        <key>USER</key>
+        <string>{username}</string>
+        <key>LOGNAME</key>
+        <string>{username}</string>
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
@@ -2312,10 +2461,10 @@ def generate_launchd_plist() -> str:
     </dict>
     
     <key>StandardOutPath</key>
-    <string>{log_dir}/gateway.log</string>
-    
+    <string>{launchd_stdout_path}</string>
+
     <key>StandardErrorPath</key>
-    <string>{log_dir}/gateway.error.log</string>
+    <string>{launchd_stderr_path}</string>
 </dict>
 </plist>
 """
@@ -2488,8 +2637,8 @@ def launchd_restart():
 
     try:
         pid = get_running_pid()
-        if pid is not None and _request_gateway_self_restart(pid):
-            print("✓ Service restart requested")
+        if pid is not None and _request_gateway_self_restart_detached(pid, target=target):
+            print("✓ Detached restart supervisor requested")
             return
         if pid is not None:
             try:

@@ -2182,9 +2182,15 @@ Each delegate runs as a **fresh subagent** with no shared context — provide al
 # In execute_code:
 from semanticscholar import SemanticScholar
 import requests
+import subprocess
+import time
 
-sch = SemanticScholar()
+api_key = subprocess.check_output([
+    "security", "find-generic-password", "-a", "openclaw", "-s", "semantic-scholar-api-key", "-w"
+], text=True).strip()
+sch = SemanticScholar(api_key=api_key)
 results = sch.search_paper("attention mechanism transformers", limit=5)
+time.sleep(1.1)  # Semantic Scholar free key rate limit: 1 request/sec
 for paper in results:
     doi = paper.externalIds.get('DOI', 'N/A')
     if doi != 'N/A':

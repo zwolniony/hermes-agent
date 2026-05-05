@@ -2388,12 +2388,58 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
       nullable branches in tool input schemas, so nullable unions are collapsed
       to the non-null branch and optionality remains represented solely by the
       parent object's ``required`` list.
+    * Schema-valued fields whose value is not a dict or bool (e.g. a bare
+      type-name string ``"object"`` in ``additionalProperties``) are
+      coerced into a valid subschema; otherwise OpenAI's strict-mode
+      validator rejects the whole tool list with ``'object' is not of type
+      'object', 'boolean'`` (observed against the Notion MCP server's
+      ``create_a_data_source`` tool).
 
     All repairs are provider-agnostic and ideally produce a schema valid on
     OpenAI, Anthropic, Gemini, and Moonshot in one pass.
     """
     if not schema:
         return {"type": "object", "properties": {}}
+
+    _SCHEMA_VALUED = {
+        "items", "additionalProperties", "additionalItems",
+        "if", "then", "else", "not",
+        "contains", "propertyNames",
+        "unevaluatedItems", "unevaluatedProperties",
+    }
+    _SCHEMA_LIST_VALUED = {"allOf", "anyOf", "oneOf", "prefixItems"}
+    _SCHEMA_MAP_VALUED = {
+        "properties", "patternProperties",
+        "$defs", "definitions", "dependentSchemas",
+    }
+    _JSON_SCHEMA_TYPES = {
+        "object", "array", "string", "number", "integer", "boolean", "null",
+    }
+
+    def _coerce_subschema(value):
+        if isinstance(value, (dict, bool)):
+            return value
+        if isinstance(value, str) and value in _JSON_SCHEMA_TYPES:
+            return {"type": value}
+        return {}
+
+    def _collapse_type_array(value):
+        """Collapse ``type: [A, B, ...]`` to a single string.
+
+        OpenAI's Codex strict validator and a handful of other providers
+        reject array-valued ``type`` even though JSON Schema allows it
+        (observed against Notion's ``type: ["object", "null"]`` pattern,
+        which surfaces as ``'object' is not of type 'object', 'boolean'``
+        because the validator splits the array into bare-string subschemas).
+        Drop ``"null"``; keep the first remaining concrete type.
+        """
+        if not isinstance(value, list):
+            return value
+        non_null = [t for t in value if isinstance(t, str) and t != "null" and t in _JSON_SCHEMA_TYPES]
+        if non_null:
+            return non_null[0]
+        all_str = [t for t in value if isinstance(t, str) and t in _JSON_SCHEMA_TYPES]
+        return all_str[0] if all_str else value
 
     def _rewrite_local_refs(node):
         if isinstance(node, dict):
@@ -2422,32 +2468,67 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
 
         return strip_nullable_unions(node, keep_nullable_hint=True)
 
-    def _repair_object_shape(node):
-        """Recursively repair object-shaped nodes: fill type, prune required."""
+    def _coerce_schema_values(node):
         if isinstance(node, list):
-            return [_repair_object_shape(item) for item in node]
+            return [_coerce_schema_values(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        out = {}
+        for key, value in node.items():
+            if key == "type":
+                out[key] = _collapse_type_array(value)
+            elif key in _SCHEMA_VALUED:
+                if key in {"items", "additionalItems"} and isinstance(value, list):
+                    out[key] = [_coerce_schema_values(_coerce_subschema(v)) for v in value]
+                else:
+                    out[key] = _coerce_schema_values(_coerce_subschema(value))
+            elif key in _SCHEMA_LIST_VALUED and isinstance(value, list):
+                out[key] = [_coerce_schema_values(_coerce_subschema(v)) for v in value]
+            elif key in _SCHEMA_MAP_VALUED and isinstance(value, dict):
+                out[key] = {k: _coerce_schema_values(_coerce_subschema(v)) for k, v in value.items()}
+            else:
+                out[key] = _coerce_schema_values(value)
+        return out
+
+    def _repair_schema(node):
+        """Repair a node that is known to be a JSON Schema.
+
+        Recurses only into positions that hold subschemas / maps-of-subschemas
+        / lists-of-subschemas, so user property maps (whose keys are arbitrary
+        names like ``"type"`` or ``"properties"``) are never mistaken for
+        schema dicts.
+        """
+        if isinstance(node, bool):
+            return node
         if not isinstance(node, dict):
             return node
 
-        repaired = {k: _repair_object_shape(v) for k, v in node.items()}
+        repaired: Dict[str, Any] = {}
+        for key, value in node.items():
+            if key in _SCHEMA_VALUED:
+                if key in {"items", "additionalItems"} and isinstance(value, list):
+                    repaired[key] = [_repair_schema(v) for v in value]
+                else:
+                    repaired[key] = _repair_schema(value)
+            elif key in _SCHEMA_LIST_VALUED and isinstance(value, list):
+                repaired[key] = [_repair_schema(v) for v in value]
+            elif key in _SCHEMA_MAP_VALUED and isinstance(value, dict):
+                repaired[key] = {k: _repair_schema(v) for k, v in value.items()}
+            else:
+                repaired[key] = value
 
-        # Coerce missing / null type when the shape is clearly an object
-        # (has properties or required but no type).
+        # Coerce missing / null type when the shape is clearly an object.
         if not repaired.get("type") and (
             "properties" in repaired or "required" in repaired
         ):
             repaired["type"] = "object"
 
         if repaired.get("type") == "object":
-            # Ensure properties exists so required can reference it safely
             if "properties" not in repaired or not isinstance(
                 repaired.get("properties"), dict
             ):
-                repaired["properties"] = {} if "properties" not in repaired else repaired["properties"]
-                if not isinstance(repaired.get("properties"), dict):
-                    repaired["properties"] = {}
+                repaired["properties"] = {}
 
-            # Prune required to only include names that exist in properties
             required = repaired.get("required")
             if isinstance(required, list):
                 props = repaired.get("properties") or {}
@@ -2462,7 +2543,8 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
 
     normalized = _rewrite_local_refs(schema)
     normalized = _strip_nullable_union(normalized)
-    normalized = _repair_object_shape(normalized)
+    normalized = _coerce_schema_values(normalized)
+    normalized = _repair_schema(normalized)
 
     # Ensure top-level is a well-formed object schema
     if not isinstance(normalized, dict):
