@@ -747,6 +747,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if "free_response_channels" in platform_cfg:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
+                if "free_response_users" in platform_cfg:
+                    bridged["free_response_users"] = platform_cfg["free_response_users"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if "dm_policy" in platform_cfg:
@@ -765,6 +767,12 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
                     else:
                         bridged["channel_prompts"] = channel_prompts
+                if "user_prompts" in platform_cfg:
+                    user_prompts = platform_cfg["user_prompts"]
+                    if isinstance(user_prompts, dict):
+                        bridged["user_prompts"] = {str(k): v for k, v in user_prompts.items()}
+                    else:
+                        bridged["user_prompts"] = user_prompts
                 enabled_was_explicit = "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit:
                     continue
@@ -809,6 +817,11 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
+                fru = discord_cfg.get("free_response_users")
+                if fru is not None and not os.getenv("DISCORD_FREE_RESPONSE_USERS"):
+                    if isinstance(fru, list):
+                        fru = ",".join(str(v) for v in fru)
+                    os.environ["DISCORD_FREE_RESPONSE_USERS"] = str(fru)
                 if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
                 if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):

@@ -731,10 +731,17 @@ class DiscordAdapter(BasePlatformAdapter):
                         if hasattr(message.channel, "parent_id") and message.channel.parent_id:
                             _parent_id = str(message.channel.parent_id)
                         _free_channels = adapter_self._discord_free_response_channels()
+                        _free_users = adapter_self._discord_free_response_users()
                         _channel_ids = {_channel_id}
                         if _parent_id:
                             _channel_ids.add(_parent_id)
-                        if "*" not in _free_channels and not (_channel_ids & _free_channels):
+                        _author_id = str(getattr(message.author, "id", ""))
+                        _is_free_user = "*" in _free_users or _author_id in _free_users
+                        if (
+                            "*" not in _free_channels
+                            and not (_channel_ids & _free_channels)
+                            and not _is_free_user
+                        ):
                             return
 
                 await self._handle_message(message)
@@ -3240,6 +3247,37 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
+    def _discord_free_response_users(self) -> set:
+        """Return Discord user IDs whose channel messages do not require a bot mention.
+
+        This is narrower than setting ``require_mention: false`` globally: it
+        lets a trusted secondary user talk to the bot naturally in Discord
+        without making every allowed user wake the bot on every message.
+        """
+        raw = self.config.extra.get("free_response_users")
+        if raw is None:
+            raw = os.getenv("DISCORD_FREE_RESPONSE_USERS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip() if raw is not None else ""
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
+
+    def _resolve_user_prompt(self, user_id: str) -> str | None:
+        """Resolve a Discord per-user prompt by numeric user ID."""
+        prompts = self.config.extra.get("user_prompts")
+        if not isinstance(prompts, dict):
+            return None
+        prompt = prompts.get(str(user_id))
+        return str(prompt) if prompt else None
+
+    @staticmethod
+    def _combine_prompts(*parts: str | None) -> str | None:
+        """Combine optional prompt snippets while preserving ordering."""
+        cleaned = [str(part).strip() for part in parts if str(part or "").strip()]
+        return "\n\n".join(cleaned) if cleaned else None
+
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
@@ -3792,12 +3830,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 or bool(channel_ids & free_channels)
                 or is_voice_linked_channel
             )
+            free_users = self._discord_free_response_users()
+            author_id = str(getattr(message.author, "id", ""))
+            is_free_user = "*" in free_users or author_id in free_users
 
             # Skip the mention check if the message is in a thread where
             # the bot has previously participated (auto-created or replied in).
             in_bot_thread = is_thread and thread_id in self._threads
 
-            if require_mention and not is_free_channel and not in_bot_thread:
+            if require_mention and not is_free_channel and not is_free_user and not in_bot_thread:
                 if self._client.user not in message.mentions and not mention_prefix:
                     return
         # Auto-thread: when enabled, automatically create a thread for every
@@ -3811,7 +3852,8 @@ class DiscordAdapter(BasePlatformAdapter):
             skip_thread = bool(channel_ids & no_thread_channels)
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in ("true", "1", "yes")
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+            free_response_inline = is_free_channel or is_free_user
+            if auto_thread and not skip_thread and not free_response_inline and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
@@ -3981,7 +4023,10 @@ class DiscordAdapter(BasePlatformAdapter):
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
-        _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
+        _channel_prompt = self._combine_prompts(
+            self._resolve_channel_prompt(_chan_id, _parent_id or None),
+            self._resolve_user_prompt(str(getattr(message.author, "id", ""))),
+        )
 
         reply_to_id = None
         reply_to_text = None
